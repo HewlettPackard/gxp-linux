@@ -65,11 +65,11 @@ static void nf_flow_rule_lwt_match(struct nf_flow_match *match,
 		       sizeof(struct in6_addr));
 		if (memcmp(&key->enc_ipv6.src, &in6addr_any,
 			   sizeof(struct in6_addr)))
-			memset(&key->enc_ipv6.src, 0xff,
+			memset(&mask->enc_ipv6.src, 0xff,
 			       sizeof(struct in6_addr));
 		if (memcmp(&key->enc_ipv6.dst, &in6addr_any,
 			   sizeof(struct in6_addr)))
-			memset(&key->enc_ipv6.dst, 0xff,
+			memset(&mask->enc_ipv6.dst, 0xff,
 			       sizeof(struct in6_addr));
 		enc_keys |= BIT(FLOW_DISSECTOR_KEY_ENC_IPV6_ADDRS);
 		key->enc_control.addr_type = FLOW_DISSECTOR_KEY_IPV6_ADDRS;
@@ -1048,6 +1048,14 @@ void nf_flow_offload_stats(struct nf_flowtable *flowtable,
 		return;
 
 	flow_offload_queue_work(offload);
+}
+
+void nf_flow_table_offload_flush_cleanup(struct nf_flowtable *flowtable)
+{
+	if (nf_flowtable_hw_offload(flowtable)) {
+		flush_workqueue(nf_flow_offload_del_wq);
+		nf_flow_table_gc_run(flowtable);
+	}
 }
 
 void nf_flow_table_offload_flush(struct nf_flowtable *flowtable)
