@@ -1,12 +1,7 @@
-// SPDX-License-Identifier: GPL-2.0
-/* Copyright (C) 2018-2019 Hewlett-Packard Development Company, L.P.
- *
- * Video Capture Device for GXP Thumbnail
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
- */
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C)  2023 Hewlett Packard Enterprise
+
+
 #include <linux/atomic.h>
 #include <linux/bitfield.h>
 #include <linux/bitmap.h>
@@ -41,6 +36,8 @@
 #include <media/videobuf2-dma-contig.h>
 
 
+
+
 #define DEVICE_NAME			"gxp-video"
 #define VCD_MODULE_NAME	    "vcd"
 
@@ -52,7 +49,7 @@
 
 //Default resolution 800x600 , max resolution 1024x768
 
-#define VCD_MAX_SRC_BUFFER_SIZE		0x300000 /* 1024x768 x 4 bpp */
+#define VCD_MAX_SRC_BUFFER_SIZE		(0x300000  + sizeof(struct v4l2_rect))/* 1024x768 x 4 bpp */
 
 
 #define THUMBNAIL_CFG                0x00
@@ -145,7 +142,7 @@ static bool gxp_video_alloc_buf(struct gxp_video *video,
 	if (size > VCD_MAX_SRC_BUFFER_SIZE)
 		size = VCD_MAX_SRC_BUFFER_SIZE;
 
-	addr->virt = dma_alloc_coherent(video->dev, size, &addr->dma,
+	addr->virt = dma_alloc_coherent(video->dev, size + sizeof(struct v4l2_rect), &addr->dma,
 					GFP_KERNEL);
 
 	if (!addr->virt)
@@ -163,8 +160,6 @@ static void gxp_video_free_buf(struct gxp_video *video,
 	addr->size = 0;
 	addr->dma = 0ULL;
 	addr->virt = NULL;
-    pr_info("<TB_VIDEO> BUF FREE\n");
-
 }
 
 
@@ -178,56 +173,33 @@ static int thumbnail_wait_for_axi(struct gxp_video *video)
 
 	ret = regmap_read_poll_timeout(vcd, THUMBNAIL_TNAXISTS, val,
 				       !(val & (TNAXISTS_AXID|TNAXISTS_AXIR)), 100,
-				       5000);
-
+				       500000);
 	if (ret) {
-        pr_err("<TN_VIDEO> AXI BUS is busy ...\n");
-		dev_err(video->dev, "Wait for AXI timeout\n");
+		dev_err(video->dev, "<TB_VIDEO> Wait for AXI timeout\n");
 		return -EBUSY;
 	}
-
-    pr_err("<TN_VIDEO> AXI OK\n");
     return 0;
 
 }
 
 
-static void gxpvd_capture_frame(struct gxp_video *video, uint32_t addr)
+static void gxpvd_enable(struct gxp_video *video)
 {
-	// void __iomem *base = info->screen_base;
-    struct regmap *vcd = video->vcd_regmap;
-
-
-	uint32_t reg = 0;
-    pr_info("<TN_VIDEO> START CAPTURE ..., %x\n",addr);
-
-
-    regmap_write(vcd, THUMBNAIL_CFG, 0x00000000);
-//	writel(0x00000000, reg_base + THUMBNAIL_CFG);
+	struct regmap *vcd = video->vcd_regmap;
+    uint32_t reg = 0;
+    
+	regmap_write(vcd, THUMBNAIL_CFG, 0x00000000);
 	thumbnail_wait_for_axi(video);
-
 	if (gBpp == 4){
         regmap_write(vcd, THUMBNAIL_CFG, 0x00000100);
-//        writel(0x00000100, reg_base + THUMBNAIL_CFG);
     }
-
     regmap_write(vcd, THUMBNAIL_HORIZ_SIZE, (gWidth - 1));
     regmap_write(vcd, THUMBNAIL_VERT_SIZE,  (gHeight - 1));
-	//writel((gWidth - 1), reg_base + THUMBNAIL_HORIZ_SIZE);
-	//writel((gHeight - 1), reg_base + THUMBNAIL_VERT_SIZE);
-
-    regmap_write(vcd, THUMBNAIL_DEST_BAR, addr);
+    regmap_write(vcd, THUMBNAIL_DEST_BAR, video->src.dma);
     regmap_write(vcd, THUMBNAIL_DEST_PITCH, (gWidth * gBpp));
-    //writel(gxp_par->phys_mem, reg_base + THUMBNAIL_DEST_BAR);
-	//writel((gWidth * gBpp), reg_base + THUMBNAIL_DEST_PITCH);
-
 	thumbnail_wait_for_axi(video);
-
-	regmap_read(vcd, THUMBNAIL_CFG, &reg);
-//	reg = readl(reg_base + THUMBNAIL_CFG);
-
-    regmap_write(vcd, THUMBNAIL_CFG, 0x00000001 | reg);
-//    writel(0x00000001 | reg, reg_base + THUMBNAIL_CFG);
+    regmap_read(vcd, THUMBNAIL_CFG, &reg);
+	regmap_write(vcd, THUMBNAIL_CFG, 0x00000001 | reg);
 	udelay(100);
 
 
@@ -237,8 +209,6 @@ static void gxpvd_capture_frame(struct gxp_video *video, uint32_t addr)
  {
    struct regmap *vcd = video->vcd_regmap;
    regmap_write(vcd, THUMBNAIL_CFG, 0x00000000);
-//   writel(0x00000000, (info->base + THUMBNAIL_CFG) );
-
    return;
  }
 
@@ -249,14 +219,12 @@ static int gxp_video_queue_setup(struct vb2_queue *q,
 				  struct device *alloc_devs[])
 {
 	struct gxp_video *video = vb2_get_drv_priv(q);
-
 	if (*num_planes) {
 		if (sizes[0] < video->max_buffer_size)
 			return -EINVAL;
 
 		return 0;
 	}
-
 	*num_planes = 1;
 	sizes[0] = video->max_buffer_size;
 	video->num_buffers = *num_buffers;
@@ -267,8 +235,6 @@ static int gxp_video_queue_setup(struct vb2_queue *q,
 static int gxp_video_buf_prepare(struct vb2_buffer *vb)
 {
 	struct gxp_video *video = vb2_get_drv_priv(vb->vb2_queue);
-    pr_info("<TB_VIDEO> BUF PREPARE ENTER\n");
-
 	if (vb2_plane_size(vb, 0) < video->max_buffer_size)
 		return -EINVAL;
 	return 0;
@@ -279,7 +245,6 @@ static void gxp_video_bufs_done(struct gxp_video *video,
 {
 	unsigned long flags;
 	struct gxp_video_buffer *buf;
-    pr_info("<TB_VIDEO> BUFS DONE\n");
 
 	spin_lock_irqsave(&video->lock, flags);
 	list_for_each_entry(buf, &video->buffers, link)
@@ -288,48 +253,41 @@ static void gxp_video_bufs_done(struct gxp_video *video,
 	spin_unlock_irqrestore(&video->lock, flags);
 }
 
+int alpha = 255;    
+int red = 60;
+int green = 128;
+int blue = 160;
+static int iter=0;
+#include <linux/random.h>
 
 static int gxp_video_start_frame(struct gxp_video *video)
 {
     struct gxp_video_buffer *buf;
 	dma_addr_t vb_dma_addr;
     unsigned long flags;
+    void *addr;
+//	uint32_t *ptr;
 
-    int RGB ;
-    struct v4l2_bt_timings *act = &video->active_timings;
-    int h,w,b;
-    h = act->height;
-    w = act->width;
-    switch(video->pix_fmt.pixelformat){
-    case V4L2_PIX_FMT_RGB24:
-        b=4;
-    default:
-        b=2;
-    };
-    pr_info("<TB_VIDEO> Video start  frame Height: %d, Width: %d, Bytes: %d, FrameSize: %d \n",h,w,b, w*h*b);
 
     spin_lock_irqsave(&video->lock, flags);
 	buf = list_first_entry_or_null(&video->buffers,struct gxp_video_buffer, link);
 	if (!buf) {
 		spin_unlock_irqrestore(&video->lock, flags);
-		dev_dbg(video->dev, "No empty buffers; skip capture frame\n");
-        pr_info("<TB_VIDEO> No empty buffers; skip capture frame\n");
+		dev_info(video->dev, "No empty buffers; skip capture frame\n");
 		return -EPROTO;
 	}
 
     set_bit(VIDEO_FRAME_INPRG, &video->flags);
-    vb_dma_addr = vb2_dma_contig_plane_dma_addr(&buf->vb.vb2_buf, 0);
+    vb_dma_addr = vb2_dma_contig_plane_dma_addr(&buf->vb.vb2_buf, 0);    
+	addr = vb2_plane_vaddr(&buf->vb.vb2_buf, 0);
 
-    pr_info("<TB_VIDEO> START FRAME\n");
-    pr_info("<TN_VIDEO> vb_dma_addr ..., %x\n",vb_dma_addr);
+	memcpy(addr, video->src.virt, gHeight*gWidth*gBpp);
+//	ptr=(uint32_t *) addr;
+
+//	get_random_bytes(ptr, gHeight*gWidth*gBpp); 
 
 
-    gxpvd_capture_frame(video,video->src.dma);
-
-
-    memcpy(vb2_plane_vaddr(&buf->vb.vb2_buf, 0), video->src.virt, gHeight*gWidth*gBpp);
-
-    vb2_set_plane_payload(&buf->vb.vb2_buf, 0, gHeight*gWidth*gBpp);
+    vb2_set_plane_payload(&buf->vb.vb2_buf, 0, gHeight*gWidth*gBpp) ;    
     buf->vb.vb2_buf.timestamp = ktime_get_ns();
 	buf->vb.sequence = video->sequence++;
 	buf->vb.field = V4L2_FIELD_NONE;
@@ -337,9 +295,6 @@ static int gxp_video_start_frame(struct gxp_video *video)
 	list_del(&buf->link);
     spin_unlock(&video->lock);
 	clear_bit(VIDEO_FRAME_INPRG, &video->flags);
-
-    pr_info("<TB_VIDEO> CAPTURE DONE Seq: %d\n",buf->vb.sequence);
-
     return 0;
 }
 
@@ -350,10 +305,10 @@ static int gxp_video_start_streaming(struct vb2_queue *q, unsigned int count)
 	int rc;
 	struct gxp_video *video = vb2_get_drv_priv(q);
 
-    pr_info("<TB_VIDEO> Start Streaming\n");
+    dev_info(video->dev,"<TB_VIDEO> Start Streaming\n");
 	video->sequence = 0;
-
-    // fill all buffers
+	gxpvd_enable(video);
+    // fill all buffers 
 	rc = gxp_video_start_frame(video);
     while (rc==0) {
         rc = gxp_video_start_frame(video);
@@ -371,7 +326,7 @@ static int gxp_video_start_streaming(struct vb2_queue *q, unsigned int count)
 static void gxp_video_stop_streaming(struct vb2_queue *q)
 {
 	struct gxp_video *video = vb2_get_drv_priv(q);
-    pr_info("<TB_VIDEO> Stop Streaming\n");
+    dev_info(video->dev,"<TB_VIDEO> Stop Streaming\n");
 
     gxpvd_disable(video);
 	clear_bit(VIDEO_STREAMING, &video->flags);
@@ -383,9 +338,7 @@ static void gxp_video_stop_streaming(struct vb2_queue *q)
 static void gxp_video_buf_finish(struct vb2_buffer *vb)
 {
 	struct gxp_video *video = vb2_get_drv_priv(vb->vb2_queue);
-    bool empty = true;
-    pr_info("<TB_VIDEO> BUF FINISH\n");
-
+	
     thumbnail_wait_for_axi(video);
 	video->vb_index = vb->index;
 }
@@ -394,8 +347,7 @@ static void gxp_video_get_resolution(struct gxp_video *video)
 {
 	struct v4l2_bt_timings *act = &video->active_timings;
 	struct v4l2_bt_timings *det = &video->detected_timings;
-	struct regmap *gfxi;
-	u32 dispst;
+	struct regmap *gfxi;	
 
 	video->v4l2_input_status = 0;
 
@@ -409,9 +361,6 @@ static void gxp_video_get_resolution(struct gxp_video *video)
 		video->v4l2_input_status = V4L2_IN_ST_NO_SIGNAL;
 	}
 
-	dev_dbg(video->dev, "Got resolution[%dx%d] -> [%dx%d], status %d\n",
-		act->width, act->height, det->width, det->height,
-		video->v4l2_input_status);
 }
 
 static int gxp_video_start(struct gxp_video *video)
@@ -422,8 +371,7 @@ static int gxp_video_start(struct gxp_video *video)
     video->max_buffer_size = VCD_MAX_SRC_BUFFER_SIZE;
 
 	if (!gxp_video_alloc_buf(video, &video->src, video->max_buffer_size)){
-        pr_info("<TB_VIDEO> Allocation Failed\n");
-
+       dev_err(video->dev,"Failed to allocate DMA \n");
 		return -ENOMEM;
     }
 	video->pix_fmt.width = video->active_timings.width;
@@ -431,7 +379,6 @@ static int gxp_video_start(struct gxp_video *video)
 	video->pix_fmt.sizeimage = video->max_buffer_size;
 	video->pix_fmt.bytesperline = video->bytesperline;
 
-    pr_info("<TB_VIDEO> Allocation OK dma=%x , size=%x , virt=%x \n", video->src.dma, video->src.size, video->src.virt);
 	return 0;
 
 }
@@ -442,7 +389,6 @@ static void gxp_video_buf_queue(struct vb2_buffer *vb)
 	struct vb2_v4l2_buffer *vbuf = to_vb2_v4l2_buffer(vb);
 	struct gxp_video_buffer *nvb = to_gxp_video_buffer(vbuf);
 	unsigned long flags;
-    pr_info("<TB_VIDEO> BUF QUEUE\n");
 
 	spin_lock_irqsave(&video->lock, flags);
 	list_add_tail(&nvb->link, &video->buffers);
@@ -451,18 +397,17 @@ static void gxp_video_buf_queue(struct vb2_buffer *vb)
     if (test_bit(VIDEO_STREAMING, &video->flags)){
         gxp_video_start_frame(video);
     }
-
+    
 }
 
 static void gxp_video_stop(struct gxp_video *video)
 {
     set_bit(VIDEO_STOPPED, &video->flags);
 	if (video->src.size){
-		gxp_video_free_buf(video, &video->src);
-        pr_info("<TB_VIDEO> Deallocation OK\n");
+		gxp_video_free_buf(video, &video->src);        
 
-    }
-    pr_info("<TB_VIDEO> VIDEO STOP\n");
+    }  
+   dev_info(video->dev,"<TB_VIDEO> Video Stopped\n");
 
 }
 
@@ -480,7 +425,7 @@ static int gxp_video_open(struct file *file)
 	}
 
 	if (v4l2_fh_is_singular_file(file)){
-        pr_info("<TB_VIDEO> Starting Video\n");
+        dev_info(video->dev,"<TB_VIDEO> Starting Video\n");
 		gxp_video_start(video);
     }
 
@@ -497,7 +442,7 @@ static int gxp_video_release(struct file *file)
 	mutex_lock(&video->video_lock);
 
 	if (v4l2_fh_is_singular_file(file)){
-        pr_info("<TB_VIDEO> Stopping Video\n");
+        dev_info(video->dev,"<TB_VIDEO> Stopping Video\n");
 		gxp_video_stop(video);
     }
 
@@ -519,7 +464,7 @@ static const struct v4l2_file_operations gxp_video_v4l2_fops = {
 	.read = vb2_fop_read,
 };
 
-// Queue operations
+// Queue operations 
 
 static const struct vb2_ops gxp_video_vb2_ops = {
 	.queue_setup = gxp_video_queue_setup,
@@ -539,10 +484,6 @@ static int gxp_video_querycap(struct file *file, void *fh,
 	strscpy(cap->driver, DEVICE_NAME, sizeof(cap->driver));
 	strscpy(cap->card, "GXP Video Thumbnail Engine", sizeof(cap->card));
 	snprintf(cap->bus_info, sizeof(cap->bus_info), "platform:%s",DEVICE_NAME);
-    pr_info("<TB_VIDEO> QueryCaps %s %s %s\n",cap->driver, cap->card, cap->bus_info);
-	//cap->capabilities = V4L2_CAP_STREAMING | V4L2_CAP_VIDEO_CAPTURE;
-
-    pr_info("<TB_VIDEO> QueryCaps Ended\n");
     return 0;
 }
 
@@ -556,12 +497,29 @@ static int gxp_video_enum_format(struct file *file, void *fh,
 
 	return 0;
 }
-
-static int gxp_video_get_format(struct file *file, void *fh,
+static int gxp_video_set_format(struct file *file, void *fh,
 				 struct v4l2_format *f)
 {
 	struct gxp_video *video = video_drvdata(file);
 
+	if (vb2_is_busy(&video->queue))
+		return -EBUSY;
+
+	switch (f->fmt.pix.pixelformat) {
+	case V4L2_PIX_FMT_RGB24:		
+		break;
+	default:
+		return -EINVAL;
+	}
+	video->pix_fmt.pixelformat = f->fmt.pix.pixelformat;
+
+	return 0;
+}
+static int gxp_video_get_format(struct file *file, void *fh,
+				 struct v4l2_format *f)
+{
+	struct gxp_video *video = video_drvdata(file);
+	
 	f->fmt.pix = video->pix_fmt;
 
 	return 0;
@@ -588,7 +546,6 @@ static int gxp_video_query_dv_timings(struct file *file, void *fh,
 {
 	struct gxp_video *video = video_drvdata(file);
 
-    pr_info("<TB_VIDEO> Query DV TIMINGS\n");
 	gxp_video_get_resolution(video);
 
 	timings->type = V4L2_DV_BT_656_1120;
@@ -599,7 +556,6 @@ static int gxp_video_query_dv_timings(struct file *file, void *fh,
 static int gxp_video_enum_dv_timings(struct file *file, void *fh,
 				      struct v4l2_enum_dv_timings *timings)
 {
-    pr_info("<TB_VIDEO> ENUM DV TIMINGS\n");
 
     return v4l2_enum_dv_timings_cap(timings, &gxp_video_timings_cap,
 					NULL, NULL);
@@ -609,18 +565,46 @@ static int gxp_video_enum_dv_timings(struct file *file, void *fh,
 static int gxp_video_dv_timings_cap(struct file *file, void *fh,
 				     struct v4l2_dv_timings_cap *cap)
 {
-    pr_info("<TB_VIDEO> VIDEO DV TIMINGS CAP\n");
 
     *cap = gxp_video_timings_cap;
 
 	return 0;
 }
 
+static int gxp_video_set_dv_timings(struct file *file, void *fh,
+				     struct v4l2_dv_timings *timings)
+{
+	struct gxp_video *video = video_drvdata(file);
+	if (timings->bt.width == video->active_timings.width &&
+	    timings->bt.height == video->active_timings.height)
+		return 0;
+
+	if (vb2_is_busy(&video->queue)) {
+		dev_err(video->dev, "%s device busy\n", __func__);
+		return -EBUSY;
+	}
+
+	video->active_timings = timings->bt;
+
+	//gxp_video_set_resolution(video);
+
+	video->pix_fmt.width = timings->bt.width;
+	video->pix_fmt.height = timings->bt.height;
+	video->pix_fmt.sizeimage = video->max_buffer_size;
+	video->pix_fmt.bytesperline = video->bytesperline;
+
+	timings->type = V4L2_DV_BT_656_1120;
+
+	return 0;
+}
+
+
+
 static int gxp_video_get_dv_timings(struct file *file, void *fh,
 				     struct v4l2_dv_timings *timings)
 {
 	struct gxp_video *video = video_drvdata(file);
-    pr_info("<TB_VIDEO> GET DV TIMINGS\n");
+    dev_info(video->dev,"<TB_VIDEO> GET DV TIMINGS\n");
 
 	timings->type = V4L2_DV_BT_656_1120;
 	timings->bt = video->active_timings;
@@ -631,7 +615,7 @@ static int gxp_video_enum_frameintervals(struct file *file, void *fh,
 					  struct v4l2_frmivalenum *fival)
 {
 	struct gxp_video *video = video_drvdata(file);
-    pr_info("<TB_VIDEO> ENUM FRAME INTERVALS\n");
+    
 
 	if (fival->index)
 		return -EINVAL;
@@ -657,8 +641,7 @@ static int gxp_video_enum_framesizes(struct file *file, void *fh,
 				      struct v4l2_frmsizeenum *fsize)
 {
 	struct gxp_video *video = video_drvdata(file);
-    pr_info("<TB_VIDEO> ENUM FRAME SIZES\n");
-
+    
 	if (fsize->index)
 		return -EINVAL;
 
@@ -676,8 +659,7 @@ static int gxp_video_get_parm(struct file *file, void *fh,
 			       struct v4l2_streamparm *a)
 {
 	struct gxp_video *video = video_drvdata(file);
-    pr_info("<TB_VIDEO> GET PARAM\n");
-
+    
 	a->parm.capture.capability = V4L2_CAP_TIMEPERFRAME;
 	a->parm.capture.readbuffers = 3;
 	a->parm.capture.timeperframe.numerator = 1;
@@ -693,7 +675,7 @@ static int gxp_video_set_parm(struct file *file, void *fh,
 			       struct v4l2_streamparm *a)
 {
 	unsigned int frame_rate = 0;
-    pr_info("<TB_VIDEO> SET PARAM\n");
+    
 
 	a->parm.capture.capability = V4L2_CAP_TIMEPERFRAME;
 	a->parm.capture.readbuffers = 3;
@@ -714,7 +696,6 @@ static int gxp_video_set_parm(struct file *file, void *fh,
 static int gxp_video_sub_event(struct v4l2_fh *fh,
 				  const struct v4l2_event_subscription *sub)
 {
-    pr_info("<TB_VIDEO> SUB EVENT\n");
 	switch (sub->type) {
 	case V4L2_EVENT_SOURCE_CHANGE:
 		return v4l2_src_change_event_subscribe(fh, sub);
@@ -730,7 +711,6 @@ static int gxp_video_enum_input(struct file *file, void *fh,
 				   struct v4l2_input *inp)
 {
 	struct gxp_video *video = video_drvdata(file);
-    pr_info("<TB_VIDEO> ENUM INPUT\n");
 
 	if (inp->index)
 		return -EINVAL;
@@ -746,14 +726,12 @@ static int gxp_video_enum_input(struct file *file, void *fh,
 static int gxp_video_get_input(struct file *file, void *fh, unsigned int *i)
 {
 	*i = 0;
-    pr_info("<TB_VIDEO> GET INPUT\n");
 
 	return 0;
 }
 
 static int gxp_video_set_input(struct file *file, void *fh, unsigned int i)
-{
-    pr_info("<TB_VIDEO> SET INPUT\n");
+{  
 	if (i)
 		return -EINVAL;
 
@@ -767,7 +745,7 @@ static const struct v4l2_ioctl_ops gxp_video_ioctls = {
 
 	.vidioc_enum_fmt_vid_cap = gxp_video_enum_format,
 	.vidioc_g_fmt_vid_cap = gxp_video_get_format,
-	.vidioc_s_fmt_vid_cap = gxp_video_get_format,
+	.vidioc_s_fmt_vid_cap = gxp_video_set_format,
 	.vidioc_try_fmt_vid_cap = gxp_video_get_format,
 
 	.vidioc_reqbufs = vb2_ioctl_reqbufs,
@@ -787,6 +765,8 @@ static const struct v4l2_ioctl_ops gxp_video_ioctls = {
 	.vidioc_s_parm = gxp_video_set_parm,
 	.vidioc_enum_framesizes = gxp_video_enum_framesizes,
 	.vidioc_enum_frameintervals = gxp_video_enum_frameintervals,
+    .vidioc_s_dv_timings = gxp_video_set_dv_timings,
+
 	.vidioc_g_dv_timings = gxp_video_get_dv_timings,
 	.vidioc_query_dv_timings = gxp_video_query_dv_timings,
 	.vidioc_enum_dv_timings = gxp_video_enum_dv_timings,
@@ -897,7 +877,7 @@ int gxpvd_probe(struct platform_device *pdev)
 
     // Get thumbnail configuration
 
-    // Default bits-per-pixel = 16 bits
+    // Default bits-per-pixel = 32 bits
     of_property_read_u32(pdev->dev.of_node, "bits-per-pixel",
                 &bits_per_pixel);
     switch (bits_per_pixel) {
@@ -918,7 +898,7 @@ int gxpvd_probe(struct platform_device *pdev)
     if (ret || gHeight > 768 || gHeight < 0)
         gHeight = 600;
 
-    pr_info("<TB_VIDEO> gBpp = %d, gWidth = %d, gHeight = %d\n",
+    dev_info(video->dev,"<TB_VIDEO> gBpp = %d, gWidth = %d, gHeight = %d\n",
         gBpp, gWidth, gHeight);
 
 
@@ -953,7 +933,6 @@ int gxpvd_probe(struct platform_device *pdev)
 	if (rc)
 		return rc;
 
-    pr_info("<TB_VIDEO> GXP video driver probed\n");
 	dev_info(video->dev, "GXP video driver probed\n");
 
 
